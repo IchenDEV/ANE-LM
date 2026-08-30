@@ -19,6 +19,7 @@ enum {
 };
 
 ane_lm_runtime_t *ane_lm_create(const char *model_directory, char **error_out);
+int32_t ane_lm_validate_model(const char *model_directory, char **error_out);
 void ane_lm_destroy(ane_lm_runtime_t *runtime);
 void ane_lm_reset(ane_lm_runtime_t *runtime);
 int32_t ane_lm_vocab_size(const ane_lm_runtime_t *runtime);

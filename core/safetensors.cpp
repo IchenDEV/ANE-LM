@@ -5,6 +5,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <limits>
+#include <nlohmann/json.hpp>
 
 namespace ane_lm {
 
@@ -29,160 +31,60 @@ int SafeTensors::dtype_size(SFDtype d) {
     }
 }
 
-// JSON helpers
-static int64_t json_find(const char* json, int64_t len, int64_t pos, char c) {
-    bool in_string = false;
-    for (int64_t i = pos; i < len; i++) {
-        if (json[i] == '"' && (i == 0 || json[i-1] != '\\')) in_string = !in_string;
-        if (!in_string && json[i] == c) return i;
-    }
-    return -1;
-}
-
-static int json_string(const char* json, int64_t pos, char* out, int max_len) {
-    if (json[pos] != '"') return -1;
-    int len = 0;
-    for (int64_t i = pos + 1; json[i] != '"' || json[i-1] == '\\'; i++) {
-        if (len < max_len - 1) out[len++] = json[i];
-    }
-    out[len] = '\0';
-    return len;
-}
-
-static int64_t json_string_end(const char* json, int64_t pos) {
-    for (int64_t i = pos + 1; ; i++) {
-        if (json[i] == '"' && json[i-1] != '\\') return i + 1;
-    }
-}
-
-bool SafeTensors::parse_header(const char* json, int64_t json_len) {
+bool SafeTensors::parse_header(const char* bytes, int64_t json_len) {
     n_tensors_ = 0;
-    int64_t pos = 0;
+    auto header = nlohmann::json::parse(bytes, bytes + json_len, nullptr, false);
+    if (header.is_discarded() || !header.is_object()) return false;
 
-    pos = json_find(json, json_len, pos, '{');
-    if (pos < 0) return false;
-    pos++;
-
-    while (pos < json_len && n_tensors_ < SF_MAX_TENSORS) {
-        int64_t key_start = -1;
-        for (int64_t i = pos; i < json_len; i++) {
-            if (json[i] == '"') { key_start = i; break; }
-            if (json[i] == '}') return true;
-        }
-        if (key_start < 0) break;
-
-        char key[SF_MAX_NAME];
-        int key_len = json_string(json, key_start, key, SF_MAX_NAME);
-        if (key_len < 0) break;
-        pos = json_string_end(json, key_start);
-
-        if (strcmp(key, "__metadata__") == 0) {
-            pos = json_find(json, json_len, pos, ':');
-            if (pos < 0) break;
-            pos++;
-            int depth = 0;
-            bool in_str = false;
-            for (int64_t i = pos; i < json_len; i++) {
-                if (json[i] == '"' && (i == 0 || json[i-1] != '\\')) in_str = !in_str;
-                if (!in_str) {
-                    if (json[i] == '{') depth++;
-                    if (json[i] == '}') { depth--; if (depth == 0) { pos = i + 1; break; } }
-                }
-            }
-            if (pos < json_len && json[pos] == ',') pos++;
-            continue;
+    const size_t data_bytes = mmap_size_ - 8 - header_size_;
+    for (auto it = header.begin(); it != header.end(); ++it) {
+        if (it.key() == "__metadata__") continue;
+        if (n_tensors_ >= SF_MAX_TENSORS || it.key().size() >= SF_MAX_NAME || !it.value().is_object()) {
+            return false;
         }
 
-        SFTensor* t = &tensors_[n_tensors_];
-        strncpy(t->name, key, SF_MAX_NAME - 1);
-        t->name[SF_MAX_NAME - 1] = '\0';
-
-        pos = json_find(json, json_len, pos, ':');
-        if (pos < 0) break;
-        pos++;
-        pos = json_find(json, json_len, pos, '{');
-        if (pos < 0) break;
-        int64_t obj_start = pos;
-        pos++;
-
-        t->ndims = 0;
-        t->dtype = SFDtype::Unknown;
-        t->data_offset = 0;
-        t->data_size = 0;
-
-        int depth = 1;
-        int64_t obj_end = obj_start + 1;
-        bool in_str = false;
-        for (int64_t i = obj_end; i < json_len && depth > 0; i++) {
-            if (json[i] == '"' && (i == 0 || json[i-1] != '\\')) in_str = !in_str;
-            if (!in_str) {
-                if (json[i] == '{') depth++;
-                if (json[i] == '}') { depth--; if (depth == 0) obj_end = i; }
-            }
+        const auto& descriptor = it.value();
+        if (!descriptor.contains("dtype") || !descriptor["dtype"].is_string()
+            || !descriptor.contains("shape") || !descriptor["shape"].is_array()
+            || !descriptor.contains("data_offsets") || !descriptor["data_offsets"].is_array()
+            || descriptor["data_offsets"].size() != 2) {
+            return false;
         }
 
-        int64_t p = obj_start + 1;
-        while (p < obj_end) {
-            int64_t ks = -1;
-            for (int64_t i = p; i < obj_end; i++) {
-                if (json[i] == '"') { ks = i; break; }
+        SFTensor* tensor = &tensors_[n_tensors_];
+        memset(tensor, 0, sizeof(*tensor));
+        memcpy(tensor->name, it.key().c_str(), it.key().size() + 1);
+        const std::string dtype = descriptor["dtype"].get<std::string>();
+        tensor->dtype = parse_dtype(dtype.c_str(), static_cast<int>(dtype.size()));
+        if (tensor->dtype == SFDtype::Unknown || descriptor["shape"].size() > SF_MAX_DIMS) return false;
+
+        uint64_t numel = 1;
+        for (const auto& dimension : descriptor["shape"]) {
+            if (!dimension.is_number_integer()) return false;
+            int64_t value = dimension.get<int64_t>();
+            if (value < 0 || (value > 0 && numel > std::numeric_limits<uint64_t>::max() / value)) {
+                return false;
             }
-            if (ks < 0) break;
-
-            char prop[64];
-            json_string(json, ks, prop, 64);
-            p = json_string_end(json, ks);
-            p = json_find(json, obj_end + 1, p, ':');
-            if (p < 0) break;
-            p++;
-
-            while (p < obj_end && (json[p] == ' ' || json[p] == '\n' || json[p] == '\t' || json[p] == '\r')) p++;
-
-            if (strcmp(prop, "dtype") == 0) {
-                if (json[p] == '"') {
-                    char dtype_str[16];
-                    int dl = json_string(json, p, dtype_str, 16);
-                    t->dtype = parse_dtype(dtype_str, dl);
-                    p = json_string_end(json, p);
-                }
-            } else if (strcmp(prop, "shape") == 0) {
-                p = json_find(json, obj_end + 1, p, '[');
-                if (p < 0) break;
-                p++;
-                t->ndims = 0;
-                while (p < obj_end) {
-                    while (p < obj_end && (json[p] == ' ' || json[p] == ',')) p++;
-                    if (json[p] == ']') { p++; break; }
-                    t->shape[t->ndims++] = strtoll(json + p, nullptr, 10);
-                    while (p < obj_end && json[p] != ',' && json[p] != ']') p++;
-                }
-            } else if (strcmp(prop, "data_offsets") == 0) {
-                p = json_find(json, obj_end + 1, p, '[');
-                if (p < 0) break;
-                p++;
-                while (p < obj_end && json[p] == ' ') p++;
-                int64_t start = strtoll(json + p, nullptr, 10);
-                p = json_find(json, obj_end + 1, p, ',');
-                if (p < 0) break;
-                p++;
-                while (p < obj_end && json[p] == ' ') p++;
-                int64_t end = strtoll(json + p, nullptr, 10);
-                t->data_offset = (size_t)start;
-                t->data_size = (size_t)(end - start);
-                while (p < obj_end && json[p] != ']') p++;
-                if (p < obj_end) p++;
-            }
-
-            while (p < obj_end && (json[p] == ' ' || json[p] == ',' || json[p] == '\n' || json[p] == '\t' || json[p] == '\r')) p++;
+            tensor->shape[tensor->ndims++] = value;
+            numel *= static_cast<uint64_t>(value);
         }
 
-        pos = obj_end + 1;
+        const auto& offsets = descriptor["data_offsets"];
+        if (!offsets[0].is_number_integer() || !offsets[1].is_number_integer()) return false;
+        int64_t start = offsets[0].get<int64_t>();
+        int64_t end = offsets[1].get<int64_t>();
+        if (start < 0 || end < start || static_cast<uint64_t>(end) > data_bytes) return false;
+
+        const uint64_t item_size = static_cast<uint64_t>(dtype_size(tensor->dtype));
+        if (item_size == 0 || (numel > 0 && item_size > std::numeric_limits<uint64_t>::max() / numel)
+            || numel * item_size != static_cast<uint64_t>(end - start)) {
+            return false;
+        }
+        tensor->data_offset = static_cast<size_t>(start);
+        tensor->data_size = static_cast<size_t>(end - start);
         n_tensors_++;
-
-        while (pos < json_len && (json[pos] == ' ' || json[pos] == ',' || json[pos] == '\n' || json[pos] == '\t' || json[pos] == '\r')) pos++;
     }
-
-    return true;
+    return n_tensors_ > 0;
 }
 
 SafeTensors::~SafeTensors() {
@@ -208,7 +110,11 @@ SafeTensors* SafeTensors::open(const std::string& path) {
     }
 
     struct stat st;
-    fstat(fd, &st);
+    if (fstat(fd, &st) != 0 || st.st_size < 9) {
+        ::close(fd);
+        fprintf(stderr, "Invalid or truncated safetensors file: %s\n", path.c_str());
+        return nullptr;
+    }
     size_t file_size = st.st_size;
 
     void* base = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -218,8 +124,9 @@ SafeTensors* SafeTensors::open(const std::string& path) {
         return nullptr;
     }
 
-    uint64_t header_size = *(uint64_t*)base;
-    if (header_size > file_size - 8) {
+    uint64_t header_size = 0;
+    memcpy(&header_size, base, sizeof(header_size));
+    if (header_size == 0 || header_size > file_size - 8) {
         munmap(base, file_size);
         ::close(fd);
         fprintf(stderr, "Invalid safetensors header size: %llu\n", header_size);
@@ -274,7 +181,12 @@ float* SafeTensors::load_bf16_to_f32(const char* name, int64_t expected_numel) c
         fprintf(stderr, "Shape mismatch for %s: expected %lld, got %lld\n", name, expected_numel, n);
         return nullptr;
     }
+    if (t->dtype != SFDtype::BF16) {
+        fprintf(stderr, "Unsupported dtype for %s: expected BF16\n", name);
+        return nullptr;
+    }
     float* out = (float*)malloc(n * sizeof(float));
+    if (!out) return nullptr;
     const uint16_t* bf16 = (const uint16_t*)data(t);
     bf16_to_f32_vec(out, bf16, (int)n);
     return out;
@@ -291,7 +203,12 @@ float* SafeTensors::load_f32_direct(const char* name, int64_t expected_numel) co
         fprintf(stderr, "Shape mismatch for %s: expected %lld, got %lld\n", name, expected_numel, n);
         return nullptr;
     }
+    if (t->dtype != SFDtype::F32) {
+        fprintf(stderr, "Unsupported dtype for %s: expected F32\n", name);
+        return nullptr;
+    }
     float* out = (float*)malloc(n * sizeof(float));
+    if (!out) return nullptr;
     memcpy(out, data(t), n * sizeof(float));
     return out;
 }
@@ -307,7 +224,7 @@ float* SafeTensors::load_norm_weight(const char* name, int64_t expected_numel) c
 
 const uint16_t* SafeTensors::get_bf16_ptr(const char* name) const {
     const SFTensor* t = find(name);
-    if (!t) return nullptr;
+    if (!t || t->dtype != SFDtype::BF16) return nullptr;
     return (const uint16_t*)data(t);
 }
 

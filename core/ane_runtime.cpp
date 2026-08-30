@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include <mutex>
+#include <new>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <ftw.h>
@@ -108,6 +109,35 @@ static bool g_ane_ok = false;
 static int g_compile_count = 0;
 static bool g_ane_persist_cache = true;
 static int g_ane_cache_load_count = 0;
+
+static void ane_destroy_kernel(ANEKernel* kernel, bool force_remove_dir) {
+    if (!kernel) return;
+    if (kernel->model) {
+        id error = nullptr;
+        ((bool(*)(id,SEL,unsigned int,id*))objc_msgSend)(
+            kernel->model, sel("unloadWithQoS:error:"), 21, &error);
+    }
+    if (kernel->ioInputs) {
+        for (int i = 0; i < kernel->nInputs; i++) {
+            if (kernel->ioInputs[i]) CFRelease(kernel->ioInputs[i]);
+        }
+    }
+    if (kernel->ioOutputs) {
+        for (int i = 0; i < kernel->nOutputs; i++) {
+            if (kernel->ioOutputs[i]) CFRelease(kernel->ioOutputs[i]);
+        }
+    }
+    if (!kernel->tmpDir.empty() && (force_remove_dir || !g_ane_persist_cache)) {
+        remove_dir(kernel->tmpDir);
+    }
+    free(kernel->ioInputs);
+    free(kernel->ioOutputs);
+    free(kernel->inputBytes);
+    free(kernel->outputBytes);
+    objc_release_obj(kernel->request);
+    objc_release_obj(kernel->model);
+    delete kernel;
+}
 
 void ane_set_persist_cache(bool enabled) { g_ane_persist_cache = enabled; }
 int ane_compile_count() { return g_compile_count; }
@@ -407,7 +437,10 @@ static id mil_gen_fused_ffn(int dim, int inter_ch) {
 static ANEKernel* ane_compile_raw(id milText, id wdict,
                                    int nInputs, size_t* inputSizes,
                                    int nOutputs, size_t* outputSizes) {
-    if (!ane_available()) return nullptr;
+    if (!ane_available() || !milText || nInputs <= 0 || nOutputs <= 0
+        || !inputSizes || !outputSizes) return nullptr;
+    for (int i = 0; i < nInputs; i++) if (inputSizes[i] == 0) return nullptr;
+    for (int i = 0; i < nOutputs; i++) if (outputSizes[i] == 0) return nullptr;
 
     void* local_pool = objc_autoreleasePoolPush();
 
@@ -524,24 +557,38 @@ static ANEKernel* ane_compile_raw(id milText, id wdict,
     }
 
     // Create kernel struct
-    ANEKernel* k = new ANEKernel();
+    ANEKernel* k = new (std::nothrow) ANEKernel{};
+    if (!k) {
+        remove(compiledMarker.c_str());
+        ane_remove_compile_dir(td, true);
+        objc_autoreleasePoolPop(local_pool);
+        return nullptr;
+    }
     k->model = objc_retain_obj(mdl);
     k->tmpDir = td;
     k->nInputs = nInputs;
     k->nOutputs = nOutputs;
     k->inputBytes = (size_t*)malloc(nInputs * sizeof(size_t));
     k->outputBytes = (size_t*)malloc(nOutputs * sizeof(size_t));
+    k->ioInputs = (IOSurfaceRef*)calloc(nInputs, sizeof(IOSurfaceRef));
+    k->ioOutputs = (IOSurfaceRef*)calloc(nOutputs, sizeof(IOSurfaceRef));
+    if (!k->inputBytes || !k->outputBytes || !k->ioInputs || !k->ioOutputs) {
+        fprintf(stderr, "ANE: failed to allocate kernel resources\n");
+        remove(compiledMarker.c_str());
+        ane_destroy_kernel(k, true);
+        objc_autoreleasePoolPop(local_pool);
+        return nullptr;
+    }
     memcpy(k->inputBytes, inputSizes, nInputs * sizeof(size_t));
     memcpy(k->outputBytes, outputSizes, nOutputs * sizeof(size_t));
 
     // Create IOSurfaces
-    k->ioInputs = (IOSurfaceRef*)malloc(nInputs * sizeof(IOSurfaceRef));
-    k->ioOutputs = (IOSurfaceRef*)malloc(nOutputs * sizeof(IOSurfaceRef));
     for (int i = 0; i < nInputs; i++) {
         k->ioInputs[i] = ane_create_surface(inputSizes[i]);
         if (!k->ioInputs[i] || !ane_zero_surface(k->ioInputs[i])) {
             fprintf(stderr, "ANE: failed to init input IOSurface %d\n", i);
-            delete k;
+            remove(compiledMarker.c_str());
+            ane_destroy_kernel(k, true);
             objc_autoreleasePoolPop(local_pool);
             return nullptr;
         }
@@ -550,7 +597,8 @@ static ANEKernel* ane_compile_raw(id milText, id wdict,
         k->ioOutputs[i] = ane_create_surface(outputSizes[i]);
         if (!k->ioOutputs[i] || !ane_zero_surface(k->ioOutputs[i])) {
             fprintf(stderr, "ANE: failed to init output IOSurface %d\n", i);
-            delete k;
+            remove(compiledMarker.c_str());
+            ane_destroy_kernel(k, true);
             objc_autoreleasePoolPop(local_pool);
             return nullptr;
         }
@@ -577,6 +625,13 @@ static ANEKernel* ane_compile_raw(id milText, id wdict,
         ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(
             g_ANEReq, sel("requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:"),
             wIns, iIdx, wOuts, oIdx, (id)nullptr, (id)nullptr, ns_int(0)));
+    if (!k->request) {
+        fprintf(stderr, "ANE: failed to create request\n");
+        remove(compiledMarker.c_str());
+        ane_destroy_kernel(k, true);
+        objc_autoreleasePoolPop(local_pool);
+        return nullptr;
+    }
 
     objc_autoreleasePoolPop(local_pool);
     return k;
@@ -648,20 +703,7 @@ bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int
 }
 
 void ane_free(ANEKernel* k) {
-    if (!k) return;
-    id e = nullptr;
-    ((bool(*)(id,SEL,unsigned int,id*))objc_msgSend)(
-        k->model, sel("unloadWithQoS:error:"), 21, &e);
-    for (int i = 0; i < k->nInputs; i++) CFRelease(k->ioInputs[i]);
-    for (int i = 0; i < k->nOutputs; i++) CFRelease(k->ioOutputs[i]);
-    if (!g_ane_persist_cache) {
-        remove_dir(k->tmpDir);
-    }
-    free(k->ioInputs); free(k->ioOutputs);
-    free(k->inputBytes); free(k->outputBytes);
-    objc_release_obj(k->request);
-    objc_release_obj(k->model);
-    delete k;
+    ane_destroy_kernel(k, false);
 }
 
 void ane_free_layer(LayerANEKernels* lk) {
@@ -675,6 +717,7 @@ void ane_free_layer(LayerANEKernels* lk) {
 // ============ High-level compile functions ============
 
 ANEKernel* ane_compile_matmul(const uint16_t* bf16_weights, int out_dim, int in_dim) {
+    if (!bf16_weights || out_dim <= 0 || in_dim <= 0) return nullptr;
     void* pool = objc_autoreleasePoolPush();
     id wdict = build_weight_dict_1(bf16_weights, out_dim * in_dim, "weight");
     id mil = mil_gen_matmul(out_dim, in_dim);
@@ -688,6 +731,7 @@ ANEKernel* ane_compile_matmul(const uint16_t* bf16_weights, int out_dim, int in_
 ANEKernel* ane_compile_fused_2(const uint16_t* bf16_a, int a_out,
                                 const uint16_t* bf16_b, int b_out,
                                 int in_dim) {
+    if (!bf16_a || !bf16_b || a_out <= 0 || b_out <= 0 || in_dim <= 0) return nullptr;
     size_t a_count = (size_t)a_out * in_dim;
     size_t b_count = (size_t)b_out * in_dim;
     uint16_t* combined = (uint16_t*)malloc((a_count + b_count) * sizeof(uint16_t));
@@ -703,6 +747,8 @@ ANEKernel* ane_compile_fused_3(const uint16_t* bf16_a, int a_out,
                                 const uint16_t* bf16_b, int b_out,
                                 const uint16_t* bf16_c, int c_out,
                                 int in_dim) {
+    if (!bf16_a || !bf16_b || !bf16_c || a_out <= 0 || b_out <= 0 || c_out <= 0
+        || in_dim <= 0) return nullptr;
     size_t a_count = (size_t)a_out * in_dim;
     size_t b_count = (size_t)b_out * in_dim;
     size_t c_count = (size_t)c_out * in_dim;

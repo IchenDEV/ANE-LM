@@ -1,6 +1,7 @@
 #include "include/ane_lm_runtime.h"
 
 #include "../core/ane_runtime.h"
+#include "../core/model_loader.h"
 #include "../core/sampling.h"
 #include "../models/llm/qwen3.h"
 #include <nlohmann/json.hpp>
@@ -39,7 +40,111 @@ void seed_sampler_once() {
     std::call_once(once, [] { srand48(0x414E454C4D); });
 }
 
+int64_t required_positive_integer(
+    const nlohmann::json& object,
+    const char *key,
+    int64_t maximum) {
+    if (!object.contains(key) || !object[key].is_number_integer()) {
+        throw std::runtime_error(std::string("Missing or invalid Qwen3 config value: ") + key);
+    }
+    int64_t value = object[key].get<int64_t>();
+    if (value <= 0 || value > maximum) {
+        throw std::runtime_error(std::string("Unsupported Qwen3 config value: ") + key);
+    }
+    return value;
+}
+
+void require_bf16_tensor(
+    const ane_lm::ModelWeights& weights,
+    const std::string& name,
+    std::initializer_list<int64_t> expected_shape) {
+    const ane_lm::SFTensor *tensor = weights.find(name.c_str());
+    if (!tensor) throw std::runtime_error("Missing Qwen3 tensor: " + name);
+    if (tensor->dtype != ane_lm::SFDtype::BF16) {
+        throw std::runtime_error("Qwen3 tensor must use BF16: " + name);
+    }
+    if (tensor->ndims != static_cast<int>(expected_shape.size())) {
+        throw std::runtime_error("Invalid Qwen3 tensor rank: " + name);
+    }
+    int index = 0;
+    for (int64_t dimension : expected_shape) {
+        if (tensor->shape[index++] != dimension) {
+            throw std::runtime_error("Invalid Qwen3 tensor shape: " + name);
+        }
+    }
+}
+
+void validate_model_directory(const std::string& model_directory) {
+    std::ifstream config(model_directory + "/config.json");
+    if (!config.is_open()) throw std::runtime_error("Missing config.json");
+    nlohmann::json json = nlohmann::json::parse(config, nullptr, false);
+    if (json.is_discarded() || !json.is_object() || json.value("model_type", "") != "qwen3") {
+        throw std::runtime_error("Only Qwen3 models are supported");
+    }
+
+    const nlohmann::json& text = json.contains("text_config") ? json["text_config"] : json;
+    if (!text.is_object()) throw std::runtime_error("Invalid Qwen3 text_config");
+    const int64_t hidden = required_positive_integer(text, "hidden_size", 65536);
+    const int64_t intermediate = required_positive_integer(text, "intermediate_size", 262144);
+    const int64_t layers = required_positive_integer(text, "num_hidden_layers", 256);
+    const int64_t q_heads = required_positive_integer(text, "num_attention_heads", 256);
+    const int64_t kv_heads = required_positive_integer(text, "num_key_value_heads", 256);
+    const int64_t vocab = required_positive_integer(text, "vocab_size", 10000000);
+    required_positive_integer(text, "max_position_embeddings", 10000000);
+    const int64_t head_dim = text.contains("head_dim")
+        ? required_positive_integer(text, "head_dim", 4096)
+        : hidden / q_heads;
+    if (hidden % q_heads != 0 || q_heads * head_dim != hidden || kv_heads > q_heads
+        || head_dim % 2 != 0) {
+        throw std::runtime_error("Unsupported Qwen3 attention dimensions");
+    }
+
+    bool tied = json.value("tie_word_embeddings", text.value("tie_word_embeddings", true));
+    std::unique_ptr<ane_lm::ModelWeights> weights = ane_lm::ModelWeights::open(model_directory);
+    if (!weights) throw std::runtime_error("Invalid or incomplete Qwen3 safetensors weights");
+
+    require_bf16_tensor(*weights, "model.embed_tokens.weight", {vocab, hidden});
+    if (!tied) require_bf16_tensor(*weights, "lm_head.weight", {vocab, hidden});
+    require_bf16_tensor(*weights, "model.norm.weight", {hidden});
+
+    const int64_t q_projection = q_heads * head_dim;
+    const int64_t kv_projection = kv_heads * head_dim;
+    for (int64_t layer = 0; layer < layers; ++layer) {
+        const std::string prefix = "model.layers." + std::to_string(layer);
+        require_bf16_tensor(*weights, prefix + ".input_layernorm.weight", {hidden});
+        require_bf16_tensor(*weights, prefix + ".post_attention_layernorm.weight", {hidden});
+        require_bf16_tensor(*weights, prefix + ".self_attn.q_norm.weight", {head_dim});
+        require_bf16_tensor(*weights, prefix + ".self_attn.k_norm.weight", {head_dim});
+        require_bf16_tensor(*weights, prefix + ".self_attn.q_proj.weight", {q_projection, hidden});
+        require_bf16_tensor(*weights, prefix + ".self_attn.k_proj.weight", {kv_projection, hidden});
+        require_bf16_tensor(*weights, prefix + ".self_attn.v_proj.weight", {kv_projection, hidden});
+        require_bf16_tensor(*weights, prefix + ".self_attn.o_proj.weight", {hidden, q_projection});
+        require_bf16_tensor(*weights, prefix + ".mlp.gate_proj.weight", {intermediate, hidden});
+        require_bf16_tensor(*weights, prefix + ".mlp.up_proj.weight", {intermediate, hidden});
+        require_bf16_tensor(*weights, prefix + ".mlp.down_proj.weight", {hidden, intermediate});
+    }
+}
+
 } // namespace
+
+extern "C" int32_t ane_lm_validate_model(
+    const char *model_directory,
+    char **error_out) {
+    if (error_out) *error_out = nullptr;
+    if (!model_directory || model_directory[0] == '\0') {
+        set_error(error_out, "Model directory is required");
+        return ANE_LM_STATUS_ERROR;
+    }
+    try {
+        validate_model_directory(model_directory);
+        return ANE_LM_STATUS_OK;
+    } catch (const std::exception& exception) {
+        set_error(error_out, exception.what());
+    } catch (...) {
+        set_error(error_out, "Unknown ANE-LM validation error");
+    }
+    return ANE_LM_STATUS_ERROR;
+}
 
 extern "C" ane_lm_runtime_t *ane_lm_create(
     const char *model_directory,
@@ -52,12 +157,7 @@ extern "C" ane_lm_runtime_t *ane_lm_create(
 
     void *pool = objc_autoreleasePoolPush();
     try {
-        std::ifstream config(std::string(model_directory) + "/config.json");
-        if (!config.is_open()) throw std::runtime_error("Missing config.json");
-        nlohmann::json json = nlohmann::json::parse(config, nullptr, false);
-        if (json.is_discarded() || json.value("model_type", "") != "qwen3") {
-            throw std::runtime_error("Only Qwen3 models are supported");
-        }
+        validate_model_directory(model_directory);
 
         ane_lm::ane_set_persist_cache(false);
         auto runtime = std::make_unique<ane_lm_runtime>();

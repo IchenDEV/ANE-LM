@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <malloc/malloc.h>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -183,6 +184,7 @@ extern "C" void ane_lm_destroy(ane_lm_runtime_t *runtime) {
     void *pool = objc_autoreleasePoolPush();
     delete runtime;
     objc_autoreleasePoolPop(pool);
+    malloc_zone_pressure_relief(malloc_default_zone(), 0);
 }
 
 extern "C" void ane_lm_reset(ane_lm_runtime_t *runtime) {

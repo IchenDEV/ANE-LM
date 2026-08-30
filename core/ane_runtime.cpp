@@ -12,6 +12,7 @@
 #include <mutex>
 #include <new>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <ftw.h>
 #include "ane_runtime.h"
@@ -47,6 +48,14 @@ static id ns_data_nocopy(void* p, unsigned long len) {
 static id ns_data(const void* p, unsigned long len) {
     return ((id(*)(Class,SEL,const void*,unsigned long))objc_msgSend)(
         cls("NSData"), sel("dataWithBytes:length:"), p, len);
+}
+
+static void discard_malloc_pages(const void* pointer, size_t length) {
+    if (!pointer || length == 0) return;
+    const size_t page = static_cast<size_t>(getpagesize());
+    const uintptr_t begin = (reinterpret_cast<uintptr_t>(pointer) + page - 1) & ~(page - 1);
+    const uintptr_t end = (reinterpret_cast<uintptr_t>(pointer) + length) & ~(page - 1);
+    if (end > begin) madvise(reinterpret_cast<void*>(begin), end - begin, MADV_DONTNEED);
 }
 static id ns_dict(id* keys, id* values, unsigned long count) {
     return ((id(*)(Class,SEL,id*,id*,unsigned long))objc_msgSend)(
@@ -271,6 +280,20 @@ static id build_weight_dict_3(
     id keys[]   = { ns_str(ka), ns_str(kb), ns_str(kc) };
     id values[] = { ns_weight_entry(ba), ns_weight_entry(bb), ns_weight_entry(bc) };
     return ns_dict(keys, values, 3);
+}
+
+static void discard_weight_dict_buffers(id weights) {
+    if (!weights) return;
+    id keys = ((id(*)(id,SEL))objc_msgSend)(weights, sel("allKeys"));
+    unsigned long count = ((unsigned long(*)(id,SEL))objc_msgSend)(keys, sel("count"));
+    for (unsigned long index = 0; index < count; index++) {
+        id key = ((id(*)(id,SEL,unsigned long))objc_msgSend)(keys, sel("objectAtIndex:"), index);
+        id entry = ((id(*)(id,SEL,id))objc_msgSend)(weights, sel("objectForKey:"), key);
+        id data = ((id(*)(id,SEL,id))objc_msgSend)(entry, sel("objectForKey:"), ns_str("data"));
+        const void* bytes = ((const void*(*)(id,SEL))objc_msgSend)(data, sel("bytes"));
+        unsigned long length = ((unsigned long(*)(id,SEL))objc_msgSend)(data, sel("length"));
+        discard_malloc_pages(bytes, length);
+    }
 }
 
 // ============ MIL program generation ============
@@ -724,6 +747,7 @@ ANEKernel* ane_compile_matmul(const uint16_t* bf16_weights, int out_dim, int in_
     size_t in_bytes = (size_t)in_dim * SP * sizeof(uint16_t);
     size_t out_bytes = (size_t)out_dim * SP * sizeof(uint16_t);
     ANEKernel* r = ane_compile_raw(mil, wdict, 1, &in_bytes, 1, &out_bytes);
+    discard_weight_dict_buffers(wdict);
     objc_autoreleasePoolPop(pool);
     return r;
 }
@@ -739,6 +763,7 @@ ANEKernel* ane_compile_fused_2(const uint16_t* bf16_a, int a_out,
     memcpy(combined, bf16_a, a_count * sizeof(uint16_t));
     memcpy(combined + a_count, bf16_b, b_count * sizeof(uint16_t));
     ANEKernel* r = ane_compile_matmul(combined, a_out + b_out, in_dim);
+    discard_malloc_pages(combined, (a_count + b_count) * sizeof(uint16_t));
     free(combined);
     return r;
 }
@@ -759,6 +784,7 @@ ANEKernel* ane_compile_fused_3(const uint16_t* bf16_a, int a_out,
     memcpy(combined + a_count, bf16_b, b_count * sizeof(uint16_t));
     memcpy(combined + a_count + b_count, bf16_c, c_count * sizeof(uint16_t));
     ANEKernel* r = ane_compile_matmul(combined, a_out + b_out + c_out, in_dim);
+    discard_malloc_pages(combined, (a_count + b_count + c_count) * sizeof(uint16_t));
     free(combined);
     return r;
 }
@@ -780,6 +806,7 @@ ANEKernel* ane_compile_fused_ffn(const uint16_t* gate_bf16, const uint16_t* up_b
     size_t in_size = (size_t)dim * SP * sizeof(uint16_t);
     size_t out_size = (size_t)dim * SP * sizeof(uint16_t);
     ANEKernel* r = ane_compile_raw(mil, wdict, 1, &in_size, 1, &out_size);
+    discard_weight_dict_buffers(wdict);
     objc_autoreleasePoolPop(pool);
     return r;
 }

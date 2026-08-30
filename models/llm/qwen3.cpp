@@ -3,10 +3,21 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <sys/mman.h>
+#include <unistd.h>
 
 namespace ane_lm {
 
 using json = nlohmann::json;
+
+static void discard_and_free(void* pointer, size_t length) {
+    if (!pointer) return;
+    const size_t page = static_cast<size_t>(getpagesize());
+    const uintptr_t begin = (reinterpret_cast<uintptr_t>(pointer) + page - 1) & ~(page - 1);
+    const uintptr_t end = (reinterpret_cast<uintptr_t>(pointer) + length) & ~(page - 1);
+    if (end > begin) madvise(reinterpret_cast<void*>(begin), end - begin, MADV_DONTNEED);
+    free(pointer);
+}
 
 static void apply_rope_qwen3(
     float* q, float* k,
@@ -69,10 +80,10 @@ Qwen3Args Qwen3Args::from_json(const json& j) {
 }
 
 Qwen3Model::~Qwen3Model() {
-    free(embed_tokens_);
+    discard_and_free(embed_tokens_, (size_t)vocab_size_ * hidden_size_ * sizeof(float));
     free(final_norm_);
     if (!tie_word_embeddings_) {
-        free(lm_head_);
+        discard_and_free(lm_head_, (size_t)vocab_size_ * hidden_size_ * sizeof(float));
     }
 
     free(x_);

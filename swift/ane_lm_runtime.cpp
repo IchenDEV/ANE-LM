@@ -95,7 +95,7 @@ void validate_model_directory(const std::string& model_directory) {
         ? required_positive_integer(text, "head_dim", 4096)
         : hidden / q_heads;
     if ((!text.contains("head_dim") && hidden % q_heads != 0) || kv_heads > q_heads
-        || head_dim % 2 != 0) {
+        || q_heads % kv_heads != 0 || head_dim % 2 != 0) {
         throw std::runtime_error("Unsupported Qwen3 attention dimensions");
     }
 

@@ -45,17 +45,13 @@ static id ns_data_nocopy(void* p, unsigned long len) {
     return ((id(*)(Class,SEL,void*,unsigned long,bool))objc_msgSend)(
         cls("NSData"), sel("dataWithBytesNoCopy:length:freeWhenDone:"), p, len, true);
 }
+static id ns_data_unowned(void* p, unsigned long len) {
+    return ((id(*)(Class,SEL,void*,unsigned long,bool))objc_msgSend)(
+        cls("NSData"), sel("dataWithBytesNoCopy:length:freeWhenDone:"), p, len, false);
+}
 static id ns_data(const void* p, unsigned long len) {
     return ((id(*)(Class,SEL,const void*,unsigned long))objc_msgSend)(
         cls("NSData"), sel("dataWithBytes:length:"), p, len);
-}
-
-static void discard_malloc_pages(const void* pointer, size_t length) {
-    if (!pointer || length == 0) return;
-    const size_t page = static_cast<size_t>(getpagesize());
-    const uintptr_t begin = (reinterpret_cast<uintptr_t>(pointer) + page - 1) & ~(page - 1);
-    const uintptr_t end = (reinterpret_cast<uintptr_t>(pointer) + length) & ~(page - 1);
-    if (end > begin) madvise(reinterpret_cast<void*>(begin), end - begin, MADV_DONTNEED);
 }
 static id ns_dict(id* keys, id* values, unsigned long count) {
     return ((id(*)(Class,SEL,id*,id*,unsigned long))objc_msgSend)(
@@ -223,7 +219,9 @@ static bool ane_zero_surface(IOSurfaceRef surface) {
 static id build_weight_blob(const uint16_t* bf16_data, int num_elements) {
     size_t wsize = (size_t)num_elements * 2;
     size_t total = 64 + 64 + wsize;
-    uint8_t* buf = (uint8_t*)calloc(total, 1);
+    uint8_t* buf = (uint8_t*)mmap(
+        nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (buf == MAP_FAILED) return (id)nullptr;
 
     buf[0] = 0x01; buf[4] = 0x02;
     uint8_t* chunk = buf + 64;
@@ -235,7 +233,7 @@ static id build_weight_blob(const uint16_t* bf16_data, int num_elements) {
     uint16_t* fp16 = (uint16_t*)(buf + 128);
     bf16_to_f16_vec(fp16, bf16_data, num_elements);
 
-    return ns_data_nocopy(buf, total);
+    return ns_data_unowned(buf, total);
 }
 
 static id ns_weight_entry(id blob) {
@@ -246,43 +244,20 @@ static id ns_weight_entry(id blob) {
 
 static id build_weight_dict_1(const uint16_t* bf16, int numel, const char* name) {
     id blob = build_weight_blob(bf16, numel);
+    if (!blob) return (id)nullptr;
     char kbuf[128]; snprintf(kbuf, sizeof(kbuf), "@model_path/weights/%s.bin", name);
     id k = ns_str(kbuf); id v = ns_weight_entry(blob);
     return ns_dict(&k, &v, 1);
 }
 
-static id build_weight_dict_2(
-    const uint16_t* bf16_a, int numel_a, const char* name_a,
-    const uint16_t* bf16_b, int numel_b, const char* name_b)
-{
-    id ba = build_weight_blob(bf16_a, numel_a);
-    id bb = build_weight_blob(bf16_b, numel_b);
-    char ka[128], kb[128];
-    snprintf(ka, sizeof(ka), "@model_path/weights/%s.bin", name_a);
-    snprintf(kb, sizeof(kb), "@model_path/weights/%s.bin", name_b);
-    id keys[]   = { ns_str(ka), ns_str(kb) };
-    id values[] = { ns_weight_entry(ba), ns_weight_entry(bb) };
-    return ns_dict(keys, values, 2);
+static void release_data_buffer(id data) {
+    if (!data) return;
+    const void* bytes = ((const void*(*)(id,SEL))objc_msgSend)(data, sel("bytes"));
+    unsigned long length = ((unsigned long(*)(id,SEL))objc_msgSend)(data, sel("length"));
+    if (bytes && length > 0) munmap(const_cast<void*>(bytes), length);
 }
 
-static id build_weight_dict_3(
-    const uint16_t* bf16_a, int numel_a, const char* name_a,
-    const uint16_t* bf16_b, int numel_b, const char* name_b,
-    const uint16_t* bf16_c, int numel_c, const char* name_c)
-{
-    id ba = build_weight_blob(bf16_a, numel_a);
-    id bb = build_weight_blob(bf16_b, numel_b);
-    id bc = build_weight_blob(bf16_c, numel_c);
-    char ka[128], kb[128], kc[128];
-    snprintf(ka, sizeof(ka), "@model_path/weights/%s.bin", name_a);
-    snprintf(kb, sizeof(kb), "@model_path/weights/%s.bin", name_b);
-    snprintf(kc, sizeof(kc), "@model_path/weights/%s.bin", name_c);
-    id keys[]   = { ns_str(ka), ns_str(kb), ns_str(kc) };
-    id values[] = { ns_weight_entry(ba), ns_weight_entry(bb), ns_weight_entry(bc) };
-    return ns_dict(keys, values, 3);
-}
-
-static void discard_weight_dict_buffers(id weights) {
+static void release_weight_dict_buffers(id weights) {
     if (!weights) return;
     id keys = ((id(*)(id,SEL))objc_msgSend)(weights, sel("allKeys"));
     unsigned long count = ((unsigned long(*)(id,SEL))objc_msgSend)(keys, sel("count"));
@@ -290,9 +265,7 @@ static void discard_weight_dict_buffers(id weights) {
         id key = ((id(*)(id,SEL,unsigned long))objc_msgSend)(keys, sel("objectAtIndex:"), index);
         id entry = ((id(*)(id,SEL,id))objc_msgSend)(weights, sel("objectForKey:"), key);
         id data = ((id(*)(id,SEL,id))objc_msgSend)(entry, sel("objectForKey:"), ns_str("data"));
-        const void* bytes = ((const void*(*)(id,SEL))objc_msgSend)(data, sel("bytes"));
-        unsigned long length = ((unsigned long(*)(id,SEL))objc_msgSend)(data, sel("length"));
-        discard_malloc_pages(bytes, length);
+        release_data_buffer(data);
     }
 }
 
@@ -747,7 +720,7 @@ ANEKernel* ane_compile_matmul(const uint16_t* bf16_weights, int out_dim, int in_
     size_t in_bytes = (size_t)in_dim * SP * sizeof(uint16_t);
     size_t out_bytes = (size_t)out_dim * SP * sizeof(uint16_t);
     ANEKernel* r = ane_compile_raw(mil, wdict, 1, &in_bytes, 1, &out_bytes);
-    discard_weight_dict_buffers(wdict);
+    release_weight_dict_buffers(wdict);
     objc_autoreleasePoolPop(pool);
     return r;
 }
@@ -758,13 +731,14 @@ ANEKernel* ane_compile_fused_2(const uint16_t* bf16_a, int a_out,
     if (!bf16_a || !bf16_b || a_out <= 0 || b_out <= 0 || in_dim <= 0) return nullptr;
     size_t a_count = (size_t)a_out * in_dim;
     size_t b_count = (size_t)b_out * in_dim;
-    uint16_t* combined = (uint16_t*)malloc((a_count + b_count) * sizeof(uint16_t));
-    if (!combined) return nullptr;
+    size_t combined_bytes = (a_count + b_count) * sizeof(uint16_t);
+    uint16_t* combined = (uint16_t*)mmap(
+        nullptr, combined_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (combined == MAP_FAILED) return nullptr;
     memcpy(combined, bf16_a, a_count * sizeof(uint16_t));
     memcpy(combined + a_count, bf16_b, b_count * sizeof(uint16_t));
     ANEKernel* r = ane_compile_matmul(combined, a_out + b_out, in_dim);
-    discard_malloc_pages(combined, (a_count + b_count) * sizeof(uint16_t));
-    free(combined);
+    munmap(combined, combined_bytes);
     return r;
 }
 
@@ -777,15 +751,15 @@ ANEKernel* ane_compile_fused_3(const uint16_t* bf16_a, int a_out,
     size_t a_count = (size_t)a_out * in_dim;
     size_t b_count = (size_t)b_out * in_dim;
     size_t c_count = (size_t)c_out * in_dim;
-    uint16_t* combined = (uint16_t*)malloc(
-        (a_count + b_count + c_count) * sizeof(uint16_t));
-    if (!combined) return nullptr;
+    size_t combined_bytes = (a_count + b_count + c_count) * sizeof(uint16_t);
+    uint16_t* combined = (uint16_t*)mmap(
+        nullptr, combined_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (combined == MAP_FAILED) return nullptr;
     memcpy(combined, bf16_a, a_count * sizeof(uint16_t));
     memcpy(combined + a_count, bf16_b, b_count * sizeof(uint16_t));
     memcpy(combined + a_count + b_count, bf16_c, c_count * sizeof(uint16_t));
     ANEKernel* r = ane_compile_matmul(combined, a_out + b_out + c_out, in_dim);
-    discard_malloc_pages(combined, (a_count + b_count + c_count) * sizeof(uint16_t));
-    free(combined);
+    munmap(combined, combined_bytes);
     return r;
 }
 
@@ -795,6 +769,13 @@ ANEKernel* ane_compile_fused_ffn(const uint16_t* gate_bf16, const uint16_t* up_b
     id wg = build_weight_blob(gate_bf16, inter_ch * dim);
     id wu = build_weight_blob(up_bf16, inter_ch * dim);
     id wd = build_weight_blob(down_bf16, dim * inter_ch);
+    if (!wg || !wu || !wd) {
+        release_data_buffer(wg);
+        release_data_buffer(wu);
+        release_data_buffer(wd);
+        objc_autoreleasePoolPop(pool);
+        return nullptr;
+    }
 
     id keys[]   = { ns_str("@model_path/weights/wg.bin"),
                     ns_str("@model_path/weights/wu.bin"),
@@ -806,7 +787,7 @@ ANEKernel* ane_compile_fused_ffn(const uint16_t* gate_bf16, const uint16_t* up_b
     size_t in_size = (size_t)dim * SP * sizeof(uint16_t);
     size_t out_size = (size_t)dim * SP * sizeof(uint16_t);
     ANEKernel* r = ane_compile_raw(mil, wdict, 1, &in_size, 1, &out_size);
-    discard_weight_dict_buffers(wdict);
+    release_weight_dict_buffers(wdict);
     objc_autoreleasePoolPop(pool);
     return r;
 }

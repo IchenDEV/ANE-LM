@@ -1,6 +1,7 @@
 #include "qwen3.h"
 #include "../../core/cpu_ops.h"
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <fstream>
 #include <sys/mman.h>
@@ -10,13 +11,15 @@ namespace ane_lm {
 
 using json = nlohmann::json;
 
-static void discard_and_free(void* pointer, size_t length) {
-    if (!pointer) return;
-    const size_t page = static_cast<size_t>(getpagesize());
-    const uintptr_t begin = (reinterpret_cast<uintptr_t>(pointer) + page - 1) & ~(page - 1);
-    const uintptr_t end = (reinterpret_cast<uintptr_t>(pointer) + length) & ~(page - 1);
-    if (end > begin) madvise(reinterpret_cast<void*>(begin), end - begin, MADV_DONTNEED);
-    free(pointer);
+static float* load_bf16_mapped(ModelWeights* weights, const char* name, size_t count) {
+    const uint16_t* source = weights->get_bf16_ptr(name);
+    if (!source || count == 0 || count > INT_MAX) return nullptr;
+    const size_t bytes = count * sizeof(float);
+    float* result = (float*)mmap(
+        nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (result == MAP_FAILED) return nullptr;
+    bf16_to_f32_vec(result, source, (int)count);
+    return result;
 }
 
 static void apply_rope_qwen3(
@@ -80,10 +83,12 @@ Qwen3Args Qwen3Args::from_json(const json& j) {
 }
 
 Qwen3Model::~Qwen3Model() {
-    discard_and_free(embed_tokens_, (size_t)vocab_size_ * hidden_size_ * sizeof(float));
+    if (embed_tokens_) {
+        munmap(embed_tokens_, (size_t)vocab_size_ * hidden_size_ * sizeof(float));
+    }
     free(final_norm_);
     if (!tie_word_embeddings_) {
-        discard_and_free(lm_head_, (size_t)vocab_size_ * hidden_size_ * sizeof(float));
+        if (lm_head_) munmap(lm_head_, (size_t)vocab_size_ * hidden_size_ * sizeof(float));
     }
 
     free(x_);
@@ -250,14 +255,14 @@ bool Qwen3Model::load(const std::string& model_dir) {
 bool Qwen3Model::load_weights(ModelWeights* sf) {
     char name[256];
 
-    embed_tokens_ = sf->load_bf16_to_f32(
-        "model.embed_tokens.weight", (int64_t)vocab_size_ * hidden_size_);
+    embed_tokens_ = load_bf16_mapped(
+        sf, "model.embed_tokens.weight", (size_t)vocab_size_ * hidden_size_);
     if (!embed_tokens_) return false;
 
     if (tie_word_embeddings_) {
         lm_head_ = embed_tokens_;
     } else {
-        lm_head_ = sf->load_bf16_to_f32("lm_head.weight", (int64_t)vocab_size_ * hidden_size_);
+        lm_head_ = load_bf16_mapped(sf, "lm_head.weight", (size_t)vocab_size_ * hidden_size_);
         if (!lm_head_) return false;
     }
 

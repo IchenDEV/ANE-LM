@@ -250,24 +250,29 @@ static id build_weight_dict_3(
     "[buildInfo = dict<tensor<string, []>, tensor<string, []>>({{\"coremlc-version\", \"3505.4.1\"}})]\n" \
     "{\n"
 
+#define MIL_HEADER_CURRENT \
+    "program(1.3)\n" \
+    "[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3510.2.1\"}, {\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, {\"coremltools-version\", \"9.0\"}})]\n" \
+    "{\n"
+
 #define SP ANE_SPATIAL
 
 static id mil_gen_matmul(int out_dim, int in_dim) {
     char buf[4096];
     int n = snprintf(buf, sizeof(buf),
-        MIL_HEADER
-        "    func main<ios16>(tensor<fp16, [1, %d, 1, %d]> x) {\n"
-        "        tensor<fp16, [%d, %d, 1, 1]> W = const()[name = tensor<string, []>(\"W\"), "
-        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>(\"@model_path/weights/weight.bin\"), "
-        "offset = tensor<uint64, []>(64)))];\n"
-        "        tensor<string, []> pt = const()[name = tensor<string, []>(\"pt\"), val = tensor<string, []>(\"valid\")];\n"
-        "        tensor<int32, [2]> st = const()[name = tensor<string, []>(\"st\"), val = tensor<int32, [2]>([1, 1])];\n"
-        "        tensor<int32, [4]> pd = const()[name = tensor<string, []>(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
-        "        tensor<int32, [2]> dl = const()[name = tensor<string, []>(\"dl\"), val = tensor<int32, [2]>([1, 1])];\n"
-        "        tensor<int32, []> gr = const()[name = tensor<string, []>(\"gr\"), val = tensor<int32, []>(1)];\n"
+        MIL_HEADER_CURRENT
+        "    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n"
+        "        tensor<fp16, [%d, %d, 1, 1]> W = const()[name = string(\"W\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), "
+        "offset = uint64(64)))];\n"
+        "        string pt = const()[name = string(\"pt\"), val = string(\"valid\")];\n"
+        "        tensor<int32, [2]> st = const()[name = string(\"st\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, [4]> pd = const()[name = string(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+        "        tensor<int32, [2]> dl = const()[name = string(\"dl\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        int32 gr = const()[name = string(\"gr\"), val = int32(1)];\n"
         "        tensor<fp16, [1, %d, 1, %d]> y = conv(dilations = dl, groups = gr, "
         "pad = pd, pad_type = pt, strides = st, weight = W, x = x)"
-        "[name = tensor<string, []>(\"cv\")];\n"
+        "[name = string(\"cv\")];\n"
         "    } -> (y);\n"
         "}\n",
         in_dim, SP,
@@ -663,7 +668,8 @@ void ane_free_layer(LayerANEKernels* lk) {
     ane_free(lk->first_proj);
     ane_free(lk->o_proj);
     ane_free(lk->fused_ffn);
-    lk->first_proj = lk->o_proj = lk->fused_ffn = nullptr;
+    ane_free(lk->down_proj);
+    lk->first_proj = lk->o_proj = lk->fused_ffn = lk->down_proj = nullptr;
 }
 
 // ============ High-level compile functions ============
@@ -682,14 +688,14 @@ ANEKernel* ane_compile_matmul(const uint16_t* bf16_weights, int out_dim, int in_
 ANEKernel* ane_compile_fused_2(const uint16_t* bf16_a, int a_out,
                                 const uint16_t* bf16_b, int b_out,
                                 int in_dim) {
-    void* pool = objc_autoreleasePoolPush();
-    id wdict = build_weight_dict_2(bf16_a, a_out * in_dim, "wa",
-                                    bf16_b, b_out * in_dim, "wb");
-    id mil = mil_gen_fused_2(a_out, b_out, in_dim);
-    size_t in_bytes = (size_t)in_dim * SP * sizeof(uint16_t);
-    size_t out_bytes = (size_t)(a_out + b_out) * SP * sizeof(uint16_t);
-    ANEKernel* r = ane_compile_raw(mil, wdict, 1, &in_bytes, 1, &out_bytes);
-    objc_autoreleasePoolPop(pool);
+    size_t a_count = (size_t)a_out * in_dim;
+    size_t b_count = (size_t)b_out * in_dim;
+    uint16_t* combined = (uint16_t*)malloc((a_count + b_count) * sizeof(uint16_t));
+    if (!combined) return nullptr;
+    memcpy(combined, bf16_a, a_count * sizeof(uint16_t));
+    memcpy(combined + a_count, bf16_b, b_count * sizeof(uint16_t));
+    ANEKernel* r = ane_compile_matmul(combined, a_out + b_out, in_dim);
+    free(combined);
     return r;
 }
 
@@ -697,15 +703,17 @@ ANEKernel* ane_compile_fused_3(const uint16_t* bf16_a, int a_out,
                                 const uint16_t* bf16_b, int b_out,
                                 const uint16_t* bf16_c, int c_out,
                                 int in_dim) {
-    void* pool = objc_autoreleasePoolPush();
-    id wdict = build_weight_dict_3(bf16_a, a_out * in_dim, "wa",
-                                    bf16_b, b_out * in_dim, "wb",
-                                    bf16_c, c_out * in_dim, "wc");
-    id mil = mil_gen_fused_3(a_out, b_out, c_out, in_dim);
-    size_t in_bytes = (size_t)in_dim * SP * sizeof(uint16_t);
-    size_t out_bytes = (size_t)(a_out + b_out + c_out) * SP * sizeof(uint16_t);
-    ANEKernel* r = ane_compile_raw(mil, wdict, 1, &in_bytes, 1, &out_bytes);
-    objc_autoreleasePoolPop(pool);
+    size_t a_count = (size_t)a_out * in_dim;
+    size_t b_count = (size_t)b_out * in_dim;
+    size_t c_count = (size_t)c_out * in_dim;
+    uint16_t* combined = (uint16_t*)malloc(
+        (a_count + b_count + c_count) * sizeof(uint16_t));
+    if (!combined) return nullptr;
+    memcpy(combined, bf16_a, a_count * sizeof(uint16_t));
+    memcpy(combined + a_count, bf16_b, b_count * sizeof(uint16_t));
+    memcpy(combined + a_count + b_count, bf16_c, c_count * sizeof(uint16_t));
+    ANEKernel* r = ane_compile_matmul(combined, a_out + b_out + c_out, in_dim);
+    free(combined);
     return r;
 }
 

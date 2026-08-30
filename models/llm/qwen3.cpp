@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
-#include <sys/stat.h>
 
 namespace ane_lm {
 
@@ -81,6 +80,8 @@ Qwen3Model::~Qwen3Model() {
     free(logits_);
     free(scratch_qkv_);
     free(scratch_attn_);
+    free(scratch_mlp_);
+    free(scratch_mlp_tmp_);
     free(rope_cos_);
     free(rope_sin_);
 
@@ -185,6 +186,8 @@ bool Qwen3Model::load(const std::string& model_dir) {
     logits_ = (float*)calloc(vocab_size_, sizeof(float));
     scratch_qkv_ = (float*)calloc((size_t)q_proj_dim_ + 2 * kv_proj_dim_, sizeof(float));
     scratch_attn_ = (float*)calloc(std::max(full_out_dim_, hidden_size_), sizeof(float));
+    scratch_mlp_ = (float*)calloc((size_t)intermediate_size_ * 2, sizeof(float));
+    scratch_mlp_tmp_ = (float*)calloc(intermediate_size_, sizeof(float));
 
     int half_rot = rot_dim_ / 2;
     rope_cache_len_ = std::min(std::max(max_pos_, 1), 16384);
@@ -226,14 +229,7 @@ bool Qwen3Model::load(const std::string& model_dir) {
         return false;
     }
 
-    std::string blob_dir = model_dir + "/ane_weights";
-    struct stat st_blob;
-    bool has_blobs = (stat(blob_dir.c_str(), &st_blob) == 0 && S_ISDIR(st_blob.st_mode));
-    if (has_blobs) {
-        LOG("Using pre-converted ANE blobs from %s\n", blob_dir.c_str());
-    }
-
-    if (!compile_ane(sf.get(), has_blobs ? blob_dir : "")) {
+    if (!compile_ane(sf.get())) {
         return false;
     }
 
@@ -281,24 +277,13 @@ bool Qwen3Model::load_weights(ModelWeights* sf) {
     return true;
 }
 
-// Convert tensor name to blob path: "a.b.c" -> "<dir>/a/b/c.bin"
-static std::string blob_path(const std::string& dir, const char* tensor_name) {
-    std::string p = dir + "/";
-    for (const char* c = tensor_name; *c; c++) {
-        p += (*c == '.') ? '/' : *c;
-    }
-    p += ".bin";
-    return p;
-}
-
-bool Qwen3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
+bool Qwen3Model::compile_ane(ModelWeights* sf) {
     if (!ane_available()) {
         fprintf(stderr, "ANE not available, cannot run\n");
         return false;
     }
 
-    bool use_blobs = !blob_dir.empty();
-    LOG("Compiling Qwen3 ANE kernels%s...\n", use_blobs ? " (from blobs)" : "");
+    LOG("Compiling Qwen3 ANE kernels...\n");
 
     char name[256], name2[256], name3[256];
 
@@ -309,17 +294,10 @@ bool Qwen3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         snprintf(name2, sizeof(name2), "model.layers.%d.self_attn.k_proj.weight", L);
         snprintf(name3, sizeof(name3), "model.layers.%d.self_attn.v_proj.weight", L);
 
-        if (use_blobs) {
-            ane_layers_[L].first_proj = ane_compile_fused_3_blob(
-                blob_path(blob_dir, name), q_proj_dim_,
-                blob_path(blob_dir, name2), kv_proj_dim_,
-                blob_path(blob_dir, name3), kv_proj_dim_, hidden_size_);
-        } else {
-            ane_layers_[L].first_proj = ane_compile_fused_3(
-                sf->get_bf16_ptr(name), q_proj_dim_,
-                sf->get_bf16_ptr(name2), kv_proj_dim_,
-                sf->get_bf16_ptr(name3), kv_proj_dim_, hidden_size_);
-        }
+        ane_layers_[L].first_proj = ane_compile_fused_3(
+            sf->get_bf16_ptr(name), q_proj_dim_,
+            sf->get_bf16_ptr(name2), kv_proj_dim_,
+            sf->get_bf16_ptr(name3), kv_proj_dim_, hidden_size_);
 
         if (!ane_layers_[L].first_proj) {
             fprintf(stderr, "ANE first_proj compile failed for layer %d\n", L);
@@ -327,11 +305,8 @@ bool Qwen3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         }
 
         snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", L);
-        if (use_blobs) {
-            ane_layers_[L].o_proj = ane_compile_matmul_blob(blob_path(blob_dir, name), hidden_size_, full_out_dim_);
-        } else {
-            ane_layers_[L].o_proj = ane_compile_matmul(sf->get_bf16_ptr(name), hidden_size_, full_out_dim_);
-        }
+        ane_layers_[L].o_proj = ane_compile_matmul(
+            sf->get_bf16_ptr(name), hidden_size_, full_out_dim_);
         if (!ane_layers_[L].o_proj) {
             fprintf(stderr, "ANE o_proj compile failed for layer %d\n", L);
             return false;
@@ -341,17 +316,13 @@ bool Qwen3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         snprintf(name2, sizeof(name2), "model.layers.%d.mlp.up_proj.weight", L);
         snprintf(name3, sizeof(name3), "model.layers.%d.mlp.down_proj.weight", L);
 
-        if (use_blobs) {
-            ane_layers_[L].fused_ffn = ane_compile_fused_ffn_blob(
-                blob_path(blob_dir, name), blob_path(blob_dir, name2),
-                blob_path(blob_dir, name3), hidden_size_, intermediate_size_);
-        } else {
-            ane_layers_[L].fused_ffn = ane_compile_fused_ffn(
-                sf->get_bf16_ptr(name), sf->get_bf16_ptr(name2),
-                sf->get_bf16_ptr(name3), hidden_size_, intermediate_size_);
-        }
-        if (!ane_layers_[L].fused_ffn) {
-            fprintf(stderr, "ANE fused_ffn compile failed for layer %d\n", L);
+        ane_layers_[L].fused_ffn = ane_compile_fused_2(
+            sf->get_bf16_ptr(name), intermediate_size_,
+            sf->get_bf16_ptr(name2), intermediate_size_, hidden_size_);
+        ane_layers_[L].down_proj = ane_compile_matmul(
+            sf->get_bf16_ptr(name3), hidden_size_, intermediate_size_);
+        if (!ane_layers_[L].fused_ffn || !ane_layers_[L].down_proj) {
+            fprintf(stderr, "ANE packed FFN compile failed for layer %d\n", L);
             return false;
         }
     }
@@ -361,7 +332,7 @@ bool Qwen3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
     LOG("  %d ANE layer kernels ready (compiled=%d, cached=%d)\n",
         compiled + cached, compiled, cached);
 
-    if (!compile_lm_head_ane(sf, blob_dir)) {
+    if (!compile_lm_head_ane(sf)) {
         LOG("ANE LM head disabled, falling back to CPU\n");
     } else {
         LOG("  LM head ANE enabled (%d chunks)\n", (int)lm_head_kernels_.size());
@@ -370,8 +341,7 @@ bool Qwen3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
     return true;
 }
 
-bool Qwen3Model::compile_lm_head_ane(ModelWeights* sf, const std::string& blob_dir) {
-    bool use_blobs = !blob_dir.empty();
+bool Qwen3Model::compile_lm_head_ane(ModelWeights* sf) {
     const char* lm_name = tie_word_embeddings_ ? "model.embed_tokens.weight" : "lm_head.weight";
 
     const uint16_t* lm_bf16 = sf->get_bf16_ptr(lm_name);
@@ -394,8 +364,6 @@ bool Qwen3Model::compile_lm_head_ane(ModelWeights* sf, const std::string& blob_d
 
         LOG("    LM head chunk %d/%d...\r", c + 1, chunks);
 
-        // For blob mode we still use BF16 pointer here because lm_head is chunked dynamically.
-        (void)use_blobs;
         const uint16_t* chunk_w = lm_bf16 + (int64_t)offset * hidden_size_;
         lm_head_kernels_[c] = ane_compile_matmul(chunk_w, rows, hidden_size_);
         if (!lm_head_kernels_[c]) {
@@ -500,9 +468,20 @@ float* Qwen3Model::forward(int token_id, int pos) {
 
         rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
 
+        if (!ane_matvec(ane_layers_[L].fused_ffn, scratch_mlp_, x_norm_,
+                        hidden_size_, intermediate_size_ * 2)) {
+            fprintf(stderr, "ANE packed FFN input eval failed at layer %d\n", L);
+            return nullptr;
+        }
+        float* mlp_up = scratch_mlp_ + intermediate_size_;
+        silu_vec_inplace(scratch_mlp_, intermediate_size_, scratch_mlp_tmp_);
+        vDSP_vmul(scratch_mlp_, 1, mlp_up, 1,
+                  scratch_mlp_, 1, (vDSP_Length)intermediate_size_);
+
         float* mlp_out = scratch_attn_;
-        if (!ane_matvec(ane_layers_[L].fused_ffn, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
-            fprintf(stderr, "ANE fused_ffn eval failed at layer %d\n", L);
+        if (!ane_matvec(ane_layers_[L].down_proj, mlp_out, scratch_mlp_,
+                        intermediate_size_, hidden_size_)) {
+            fprintf(stderr, "ANE FFN down projection failed at layer %d\n", L);
             return nullptr;
         }
 

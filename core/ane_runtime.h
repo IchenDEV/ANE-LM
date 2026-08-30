@@ -17,6 +17,7 @@ struct LayerANEKernels {
     ANEKernel* first_proj = nullptr;
     ANEKernel* o_proj = nullptr;
     ANEKernel* fused_ffn = nullptr;
+    ANEKernel* down_proj = nullptr;
 };
 
 // Global state

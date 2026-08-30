@@ -88,13 +88,15 @@ private:
     float* logits_ = nullptr;
     float* scratch_qkv_ = nullptr;
     float* scratch_attn_ = nullptr;
+    float* scratch_mlp_ = nullptr;
+    float* scratch_mlp_tmp_ = nullptr;
     float* rope_cos_ = nullptr;
     float* rope_sin_ = nullptr;
 
     void apply_args(const Qwen3Args& args);
     bool load_weights(ModelWeights* sf);
-    bool compile_ane(ModelWeights* sf, const std::string& blob_dir);
-    bool compile_lm_head_ane(ModelWeights* sf, const std::string& blob_dir);
+    bool compile_ane(ModelWeights* sf);
+    bool compile_lm_head_ane(ModelWeights* sf);
     void free_lm_head_ane();
 
     bool forward_full_attn_core(int L, float* x, float* pre_oproj, int pos);
